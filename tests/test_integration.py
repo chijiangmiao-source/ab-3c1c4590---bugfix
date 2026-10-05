@@ -210,6 +210,134 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(b["receipt"]["receipt_id"],
                          d["repos"]["repo-b"]["activate"]["receipt_id"])
 
+    def test_same_bytes_different_release_id_get_independent_evidence(self):
+        artifact = b"shared-calibration-bytes"
+        digest = sha(artifact)
+
+        s, _ = self.post_release("dup-first", artifact)
+        self.assertEqual(s, 202)
+        d1 = self.wait_state("dup-first", "COMPLETED")
+
+        counts1 = {
+            "repo-a": self.repo_state(self.c.repo_a)["activation_count"],
+            "repo-b": self.repo_state(self.c.repo_b)["activation_count"],
+        }
+        self.assertEqual(counts1, {"repo-a": 1, "repo-b": 1})
+
+        def receipt_ids(d):
+            out = {}
+            for repo in ("repo-a", "repo-b"):
+                for op in ("prepare", "activate"):
+                    r = d["repos"][repo][op]
+                    out[(repo, op)] = r["receipt_id"]
+            return out
+
+        ids1 = receipt_ids(d1)
+        for (repo, op), rid_receipt in ids1.items():
+            self.assertTrue(rid_receipt)
+            self.assertEqual(d1["repos"][repo][op]["op_key"],
+                             op_key("dup-first", repo, op))
+
+        # A fresh, unused release id submitting the DECODE-IDENTICAL artifact
+        # must be driven through both repos under its own derived op keys.
+        s, b = self.post_release("dup-second", artifact)
+        self.assertEqual(s, 202, f"status={s} body={b}")
+        d2 = self.wait_state("dup-second", "COMPLETED")
+
+        # Each repo really processed the second release: one more activation.
+        self.assertEqual(self.repo_state(self.c.repo_a)["activation_count"], 2)
+        self.assertEqual(self.repo_state(self.c.repo_b)["activation_count"], 2)
+        self.assertEqual(self.repo_state(self.c.repo_a)["active_digest"], digest)
+        self.assertEqual(self.repo_state(self.c.repo_b)["active_digest"], digest)
+
+        ids2 = receipt_ids(d2)
+        for repo in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                key = op_key("dup-second", repo, op)
+                receipt = d2["repos"][repo][op]
+                # Evidence is bound to the second release's derived op key...
+                self.assertEqual(receipt["op_key"], key)
+                self.assertEqual(receipt["digest"], digest)
+                # ...and is the receipt the repo actually holds under that key.
+                s2, body = http_json(
+                    "GET",
+                    f"{self.c.repo_a.url if repo == 'repo-a' else self.c.repo_b.url}"
+                    f"/v1/ops/{urllib.parse.quote(key, safe='')}",
+                    timeout=5,
+                )
+                self.assertEqual(s2, 200)
+                self.assertEqual(body["receipt"]["receipt_id"], receipt["receipt_id"])
+                # Distinct first receipts: never the first release's evidence.
+                self.assertNotEqual(receipt["receipt_id"], ids1[(repo, op)])
+
+    def test_false_completed_with_foreign_evidence_heals_after_restart(self):
+        # Reproduce an already-affected release as the old code left it:
+        # a COMPLETED row whose local receipts are another release's evidence
+        # (signed, same digest, but op_key derived from a different release id).
+        artifact = b"heal-me-bytes"
+        digest = sha(artifact)
+        self.post_release("heal-first", artifact)
+        d1 = self.wait_state("heal-first", "COMPLETED")
+        store = self.c.control.store
+        foreign = store.receipts_for("heal-first")
+
+        store.insert_release("heal-second", digest, artifact, "COMPLETED")
+        for repo in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                r = foreign[repo][op]  # receipt JSON still carries heal-first op_key
+                store.put_receipt("heal-second", repo, op,
+                                  op_key("heal-second", repo, op), digest, r)
+
+        poisoned = self.state_of("heal-second")
+        self.assertEqual(poisoned["state"], "COMPLETED")
+        self.assertEqual(poisoned["repos"]["repo-a"]["activate"]["op_key"],
+                         op_key("heal-first", "repo-a", "activate"))
+
+        # Restart over the same durable store: reconciliation must detect that
+        # neither repo ever processed heal-second's keys and re-converge.
+        self.c.restart_control()
+
+        def truly_healed():
+            d = self.state_of("heal-second")
+            if d.get("state") != "COMPLETED":
+                return None  # reopened to PENDING, still re-converging
+            key = d.get("repos", {}).get("repo-a", {}).get("activate", {}).get("op_key")
+            return d if key == op_key("heal-second", "repo-a", "activate") else None
+
+        d2 = wait_for(truly_healed)
+        for repo in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                self.assertEqual(d2["repos"][repo][op]["op_key"],
+                                 op_key("heal-second", repo, op))
+                self.assertEqual(d2["repos"][repo][op]["digest"], digest)
+        # The first release is untouched and no double activation occurred.
+        self.assertEqual(self.state_of("heal-first")["state"], "COMPLETED")
+        self.assertEqual(self.repo_state(self.c.repo_a)["activation_count"], 2)
+        self.assertEqual(self.repo_state(self.c.repo_b)["activation_count"], 2)
+        self.assertEqual(
+            self.state_of("heal-first")["repos"]["repo-a"]["activate"]["receipt_id"],
+            d1["repos"]["repo-a"]["activate"]["receipt_id"],
+        )
+
+    def test_legitimate_completed_release_stable_across_restart(self):
+        self.post_release("stable-1", b"stable-bytes")
+        before = self.wait_state("stable-1", "COMPLETED")
+        counts = (self.repo_state(self.c.repo_a)["activation_count"],
+                  self.repo_state(self.c.repo_b)["activation_count"])
+        self.c.restart_control()
+        time.sleep(1.0)  # let startup reconciliation run
+        after = self.state_of("stable-1")
+        self.assertEqual(after["state"], "COMPLETED")
+        self.assertEqual(after["current_digest"], sha(b"stable-bytes"))
+        for repo in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                self.assertEqual(
+                    after["repos"][repo][op]["receipt_id"],
+                    before["repos"][repo][op]["receipt_id"],
+                )
+        self.assertEqual((self.repo_state(self.c.repo_a)["activation_count"],
+                          self.repo_state(self.c.repo_b)["activation_count"]), counts)
+
     def test_health_and_console_page(self):
         s, b = http_json("GET", f"{self.c.control.url}/healthz", timeout=5)
         self.assertEqual(s, 200)

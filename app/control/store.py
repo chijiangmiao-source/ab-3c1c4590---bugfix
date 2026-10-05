@@ -33,14 +33,6 @@ CREATE TABLE IF NOT EXISTS receipts (
   created_at TEXT NOT NULL,
   PRIMARY KEY (release_id, repo, op)
 );
-CREATE TABLE IF NOT EXISTS receipt_cache (
-  repo       TEXT NOT NULL,
-  op         TEXT NOT NULL,
-  digest     TEXT NOT NULL,
-  receipt    TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (repo, op, digest)
-);
 """
 
 
@@ -56,6 +48,10 @@ class Store:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.executescript(SCHEMA)
+            # The old receipt_cache keyed receipts by (repo, op, digest) alone,
+            # which let one release borrow another release's evidence. Drop it so
+            # stale data can never be read again.
+            self._db.execute("DROP TABLE IF EXISTS receipt_cache")
             self._db.commit()
 
     def close(self) -> None:
@@ -106,6 +102,13 @@ class Store:
             )
             self._db.commit()
 
+    def all_release_ids(self) -> list[str]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT release_id FROM releases ORDER BY created_at"
+            ).fetchall()
+        return [r[0] for r in rows]
+
     # ---- receipts (repo-side evidence) ----
     def put_receipt(self, release_id: str, repo: str, op: str, op_key: str,
                     digest: str, receipt: dict) -> None:
@@ -116,10 +119,13 @@ class Store:
                 " receipt, created_at) VALUES(?,?,?,?,?,?,?)",
                 (release_id, repo, op, op_key, digest, encoded, utcnow()),
             )
+            self._db.commit()
+
+    def delete_receipt(self, release_id: str, repo: str, op: str) -> None:
+        with self._lock:
             self._db.execute(
-                "INSERT OR IGNORE INTO receipt_cache(repo, op, digest, receipt, created_at)"
-                " VALUES(?,?,?,?,?)",
-                (repo, op, digest, encoded, utcnow()),
+                "DELETE FROM receipts WHERE release_id=? AND repo=? AND op=?",
+                (release_id, repo, op),
             )
             self._db.commit()
 
@@ -128,14 +134,6 @@ class Store:
             row = self._db.execute(
                 "SELECT receipt FROM receipts WHERE release_id=? AND repo=? AND op=?",
                 (release_id, repo, op),
-            ).fetchone()
-        return json.loads(row[0]) if row else None
-
-    def get_cached_receipt(self, repo: str, op: str, digest: str) -> dict | None:
-        with self._lock:
-            row = self._db.execute(
-                "SELECT receipt FROM receipt_cache WHERE repo=? AND op=? AND digest=?",
-                (repo, op, digest),
             ).fetchone()
         return json.loads(row[0]) if row else None
 

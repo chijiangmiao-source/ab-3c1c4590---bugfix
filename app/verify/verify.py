@@ -6,6 +6,11 @@ Phase order (per acceptance spec):
   A. Disconnect/restart convergence scenario: arm repo-b to drop its response
      right after committing the activation, restart the control service, then
      check both repos' final digests and the release evidence.
+  A2. Same digest, different release identifiers: two consecutive submissions
+     of byte-identical artifacts under unused release ids must each obtain
+     prepare/activate receipts bound to their own derived op keys (from both
+     repos, with a real second activation), and stay correct across a control
+     restart.
   B. Code tests (unittest discover).
   C. Build check (byte-compile every source file).
   D. HTTP smoke against the health page and the release API.
@@ -160,6 +165,181 @@ def phase_scenario():
           s == 200 and repo_receipt.get("receipt_id") == ctrl_receipt.get("receipt_id"),
           f"repo={repo_receipt.get('receipt_id')} control={ctrl_receipt.get('receipt_id')}")
     return rid, artifact, sha
+
+
+# ---------------------------------------------------------------------------
+# Phase A2: same digest submitted under two different release identifiers
+# ---------------------------------------------------------------------------
+def _check_evidence_bound(name: str, detail: dict, rid: str, sha: str,
+                          repo_receipts: dict) -> bool:
+    """All four receipts must be bound to rid's derived op keys and match the
+    receipts the repos actually hold under those keys."""
+    ok = True
+    repos = detail.get("repos") or {}
+    for repo in ("repo-a", "repo-b"):
+        for op in ("prepare", "activate"):
+            key = op_key(rid, repo, op)
+            r = (repos.get(repo) or {}).get(op) or {}
+            want_id = (repo_receipts.get((repo, op)) or {}).get("receipt_id")
+            cond = (
+                r.get("op_key") == key
+                and r.get("digest") == sha
+                and bool(r.get("receipt_id"))
+                and bool(r.get("sig"))
+                and r.get("receipt_id") == want_id
+            )
+            check(f"{name}: {repo} {op} evidence bound to {key}", cond,
+                  f"op_key={r.get('op_key')} digest={r.get('digest')} "
+                  f"ctrl_id={r.get('receipt_id')} repo_id={want_id}")
+            ok = ok and cond
+    return ok
+
+
+def _repo_op_receipt(base_url: str, key: str):
+    q = urllib.parse.quote(key, safe="")
+    status, body = http_json("GET", f"{base_url}/v1/ops/{q}", timeout=5)
+    return status, (body.get("receipt") if status == 200 else None)
+
+
+def phase_same_digest():
+    print("== Phase A2: 同摘要 + 不同发布标识的连续提交与重启收敛 ==", flush=True)
+    ts = int(time.time())
+    rid1 = f"same-{ts}-a"
+    rid2 = f"same-{ts}-b"
+    artifact = (f"identical-bundle:{ts}:".encode() + bytes(range(256)) * 4)[:2048]
+    sha = sha256_hex(artifact)
+    b64 = base64.b64encode(artifact).decode()
+
+    wait_until("control healthy",
+               lambda: http_json("GET", f"{CONTROL_URL}/healthz", timeout=3)[0] == 200, 60)
+
+    def release_view(rid: str):
+        status, body = get_release(rid)
+        return body if status == 200 else None
+
+    # First release: a fresh id submits the valid artifact; wait for dual-repo
+    # completion and record activation counts plus its four receipts.
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": rid1, "artifact_b64": b64}, timeout=10)
+    check("first release accepted", s == 202 and b.get("sha256") == sha,
+          f"status={s} body={b}")
+    d1 = wait_until(
+        "first release completed",
+        lambda: (lambda x: x if x and x.get("state") == "COMPLETED" else None)
+        (release_view(rid1)),
+        45,
+    )
+    check("first release exposes the digest", d1.get("current_digest") == sha)
+
+    sa1, sb1 = repo_state(REPO_A_URL), repo_state(REPO_B_URL)
+    first_counts = {"repo-a": sa1["activation_count"], "repo-b": sb1["activation_count"]}
+    first_receipts = {}
+    for repo in ("repo-a", "repo-b"):
+        for op in ("prepare", "activate"):
+            key = op_key(rid1, repo, op)
+            base = REPO_A_URL if repo == "repo-a" else REPO_B_URL
+            status, receipt = _repo_op_receipt(base, key)
+            check(f"first release: repo holds {repo} {op} receipt",
+                  status == 200 and receipt and receipt.get("op_key") == key
+                  and receipt.get("digest") == sha,
+                  f"status={status}")
+            first_receipts[(repo, op)] = receipt
+    _check_evidence_bound("first release", d1, rid1, sha, first_receipts)
+
+    # Second release: another UNUSED id, decode-identical artifact.
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": rid2, "artifact_b64": b64}, timeout=10)
+    check("second release accepted independently", s == 202 and b.get("sha256") == sha,
+          f"status={s} body={b}")
+    d2 = wait_until(
+        "second release completed",
+        lambda: (lambda x: x if x and x.get("state") == "COMPLETED" else None)
+        (release_view(rid2)),
+        45,
+    )
+    check("second release exposes the digest", d2.get("current_digest") == sha)
+
+    # Both repos must have performed operations belonging to the SECOND id:
+    # activation counts advance by exactly one on each repo.
+    sa2, sb2 = repo_state(REPO_A_URL), repo_state(REPO_B_URL)
+    check("repo-a activated the second release (count +1)",
+          sa2.get("activation_count") == first_counts["repo-a"] + 1,
+          f"{first_counts['repo-a']} -> {sa2.get('activation_count')}")
+    check("repo-b activated the second release (count +1)",
+          sb2.get("activation_count") == first_counts["repo-b"] + 1,
+          f"{first_counts['repo-b']} -> {sb2.get('activation_count')}")
+    check("both repos active digest equals shared sha256",
+          sa2.get("active_digest") == sha and sb2.get("active_digest") == sha,
+          f"a={sa2.get('active_digest')} b={sb2.get('active_digest')}")
+
+    # The repos must NOT hold anything under neither-id keys, and the second
+    # release's four receipts must be distinct first receipts of their own keys.
+    second_receipts = {}
+    distinct_ok = True
+    for repo in ("repo-a", "repo-b"):
+        for op in ("prepare", "activate"):
+            key = op_key(rid2, repo, op)
+            base = REPO_A_URL if repo == "repo-a" else REPO_B_URL
+            status, receipt = _repo_op_receipt(base, key)
+            check(f"second release: repo processed {repo} {op} key {key}",
+                  status == 200 and receipt is not None
+                  and receipt.get("op_key") == key and receipt.get("digest") == sha,
+                  f"status={status} receipt={receipt}")
+            second_receipts[(repo, op)] = receipt
+            if not receipt or receipt.get("receipt_id") == first_receipts[(repo, op)].get("receipt_id"):
+                distinct_ok = False
+    check("second release receipts are its own (not the first release's)", distinct_ok)
+    _check_evidence_bound("second release", d2, rid2, sha, second_receipts)
+
+    counts_before_restart = {
+        "repo-a": repo_state(REPO_A_URL)["activation_count"],
+        "repo-b": repo_state(REPO_B_URL)["activation_count"],
+    }
+
+    # Restart the control service: both completions must re-converge from
+    # repo-side truth, and no extra activation may occur.
+    s, hb = http_json("GET", f"{CONTROL_URL}/healthz", timeout=5)
+    old_boot = hb.get("boot_id")
+    s, _ = http_json("POST", f"{CONTROL_URL}/fault/restart", {}, timeout=5)
+    check("same-digest: control restart hook accepted", s == 200, f"status={s}")
+
+    def restarted():
+        try:
+            s, b = http_json("GET", f"{CONTROL_URL}/healthz", timeout=3)
+        except TransportError:
+            return False
+        return s == 200 and b.get("boot_id") not in (None, old_boot)
+
+    wait_until("same-digest: control restarted", restarted, 90, 0.3)
+
+    def both_still_completed_with_own_keys():
+        try:
+            _, x1 = get_release(rid1)
+            _, x2 = get_release(rid2)
+        except TransportError:
+            return None
+        if x1.get("state") != "COMPLETED" or x2.get("state") != "COMPLETED":
+            return None
+        k1 = (x1.get("repos") or {}).get("repo-a", {}).get("activate", {}).get("op_key")
+        k2 = (x2.get("repos") or {}).get("repo-a", {}).get("activate", {}).get("op_key")
+        if k1 != op_key(rid1, "repo-a", "activate"):
+            return None
+        if k2 != op_key(rid2, "repo-a", "activate"):
+            return None
+        return x1, x2
+
+    r1, r2 = wait_until("both releases converge to own-key evidence after restart",
+                        both_still_completed_with_own_keys, 60)
+    _check_evidence_bound("post-restart first release", r1, rid1, sha, first_receipts)
+    _check_evidence_bound("post-restart second release", r2, rid2, sha, second_receipts)
+
+    sa3, sb3 = repo_state(REPO_A_URL), repo_state(REPO_B_URL)
+    check("restart caused no extra activation on repo-a",
+          sa3.get("activation_count") == counts_before_restart["repo-a"],
+          f"{counts_before_restart['repo-a']} -> {sa3.get('activation_count')}")
+    check("restart caused no extra activation on repo-b",
+          sb3.get("activation_count") == counts_before_restart["repo-b"],
+          f"{counts_before_restart['repo-b']} -> {sb3.get('activation_count')}")
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +513,10 @@ def main() -> int:
         rid, artifact, sha = phase_scenario()
     except Exception as e:  # noqa: BLE001
         check("phase A (disconnect/restart scenario)", False, repr(e))
+    try:
+        phase_same_digest()
+    except Exception as e:  # noqa: BLE001
+        check("phase A2 (same digest, different release ids + restart)", False, repr(e))
     for phase in (phase_tests, phase_build):
         try:
             phase()
