@@ -163,6 +163,145 @@ def phase_scenario():
 
 
 # ---------------------------------------------------------------------------
+# Phase A2: identical bytes, different release ids -> independent evidence
+# ---------------------------------------------------------------------------
+def phase_same_digest_distinct_ids():
+    print("== Phase A2: 同摘要 / 不同发布标识的连续提交（独立双仓证据 + 重启） ==", flush=True)
+    stamp = int(time.time())
+    rid1 = f"same-{stamp}-a"
+    rid2 = f"same-{stamp}-b"
+    artifact = (f"same-bytes-bundle:{stamp}".encode() + bytes(range(256)) * 4)[:4096]
+    sha = sha256_hex(artifact)
+    b64 = base64.b64encode(artifact).decode()
+
+    def wait_completed(rid: str):
+        s, b = get_release(rid)
+        return b if s == 200 and b.get("state") == "COMPLETED" else None
+
+    def evidence(b: dict, rid: str) -> bool:
+        """All four receipts must be signed and bound to rid-derived op keys."""
+        repos = b.get("repos") or {}
+        for repo in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                r = (repos.get(repo) or {}).get(op) or {}
+                if r.get("digest") != sha or not r.get("receipt_id") or not r.get("sig"):
+                    return False
+                if r.get("op_key") != op_key(rid, repo, op):
+                    return False
+        return True
+
+    counts_before = {
+        "repo-a": repo_state(REPO_A_URL)["activation_count"],
+        "repo-b": repo_state(REPO_B_URL)["activation_count"],
+    }
+
+    # First release id with a valid Base64 artifact.
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": rid1, "artifact_b64": b64}, timeout=10)
+    check("same-digest: first release accepted", s == 202 and b.get("sha256") == sha,
+          f"status={s} body={b}")
+    d1 = wait_until("first release completed", lambda: wait_completed(rid1), 45)
+    check("same-digest: first release evidence bound to its own id",
+          evidence(d1, rid1), f"body={d1.get('repos')}")
+    first_receipts = {
+        (repo, op): ((d1.get("repos") or {}).get(repo) or {}).get(op, {}).get("receipt_id")
+        for repo in ("repo-a", "repo-b") for op in ("prepare", "activate")
+    }
+
+    counts_after_1 = {
+        "repo-a": repo_state(REPO_A_URL)["activation_count"],
+        "repo-b": repo_state(REPO_B_URL)["activation_count"],
+    }
+    check("same-digest: each repo activated once for the first release",
+          counts_after_1["repo-a"] == counts_before["repo-a"] + 1
+          and counts_after_1["repo-b"] == counts_before["repo-b"] + 1,
+          f"before={counts_before} after={counts_after_1}")
+
+    # Second, never-used release id with byte-identical content.
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": rid2, "artifact_b64": b64}, timeout=10)
+    check("same-digest: second release accepted as a new release (202)",
+          s == 202 and b.get("state") != "COMPLETED", f"status={s} body={b}")
+    d2 = wait_until("second release completed", lambda: wait_completed(rid2), 45)
+    check("same-digest: current digest exposed on completion", d2.get("current_digest") == sha)
+    check("same-digest: second release evidence bound to its own derived op keys",
+          evidence(d2, rid2), f"body={d2.get('repos')}")
+
+    # Each repo really processed the second release-derived activate key, and
+    # the receipt control holds is the one the repo serves for that key.
+    repo_processed = True
+    distinct_receipts = True
+    for base, repo in ((REPO_A_URL, "repo-a"), (REPO_B_URL, "repo-b")):
+        for op in ("prepare", "activate"):
+            key = urllib.parse.quote(op_key(rid2, repo, op), safe="")
+            s, b = http_json("GET", f"{base}/v1/ops/{key}", timeout=5)
+            ctrl = ((d2.get("repos") or {}).get(repo) or {}).get(op) or {}
+            if s != 200 or (b.get("receipt") or {}).get("receipt_id") != ctrl.get("receipt_id"):
+                repo_processed = False
+            if ctrl.get("receipt_id") == first_receipts[(repo, op)]:
+                distinct_receipts = False
+    check("same-digest: both repos processed the second release's own op keys",
+          repo_processed)
+    check("same-digest: second release got fresh receipts (not replayed first ones)",
+          distinct_receipts)
+
+    counts_after_2 = {
+        "repo-a": repo_state(REPO_A_URL)["activation_count"],
+        "repo-b": repo_state(REPO_B_URL)["activation_count"],
+    }
+    check("same-digest: each repo activated exactly once more",
+          counts_after_2["repo-a"] == counts_after_1["repo-a"] + 1
+          and counts_after_2["repo-b"] == counts_after_1["repo-b"] + 1,
+          f"after1={counts_after_1} after2={counts_after_2}")
+
+    sa, sb = repo_state(REPO_A_URL), repo_state(REPO_B_URL)
+    check("same-digest: repo-a active digest == shared sha256",
+          sa.get("active_digest") == sha, f"active={sa.get('active_digest')}")
+    check("same-digest: repo-b active digest == shared sha256",
+          sb.get("active_digest") == sha, f"active={sb.get('active_digest')}")
+
+    # Same id + same bytes stays a stable replay with no extra activation.
+    s, b = http_json("POST", f"{CONTROL_URL}/api/releases",
+                     {"release_id": rid2, "artifact_b64": b64}, timeout=10)
+    check("same-digest: resubmission of the second release replays (200)",
+          s == 200 and b.get("state") == "COMPLETED", f"status={s}")
+    time.sleep(1.0)
+    check("same-digest: replay caused no further activation",
+          repo_state(REPO_A_URL)["activation_count"] == counts_after_2["repo-a"]
+          and repo_state(REPO_B_URL)["activation_count"] == counts_after_2["repo-b"])
+
+    # Restart the control service: both releases must keep converging to real
+    # repo-side results, each still carrying only its own release-keyed evidence.
+    s, h = http_json("GET", f"{CONTROL_URL}/healthz", timeout=5)
+    old_boot = h.get("boot_id")
+    s, _ = http_json("POST", f"{CONTROL_URL}/fault/restart", {}, timeout=5)
+    check("same-digest: control restart hook accepted", s == 200, f"status={s}")
+
+    def restarted():
+        try:
+            s, b = http_json("GET", f"{CONTROL_URL}/healthz", timeout=3)
+        except TransportError:
+            return False
+        return s == 200 and b.get("boot_id") not in (None, old_boot)
+
+    wait_until("control process restarted (same-digest phase)", restarted, 90, 0.3)
+    time.sleep(1.0)
+    s, b1 = get_release(rid1)
+    check("same-digest: first release still COMPLETED after restart",
+          s == 200 and b1.get("state") == "COMPLETED" and evidence(b1, rid1),
+          f"state={b1.get('state')}")
+    s, b2 = get_release(rid2)
+    check("same-digest: second release still COMPLETED after restart with own evidence",
+          s == 200 and b2.get("state") == "COMPLETED" and evidence(b2, rid2),
+          f"state={b2.get('state')}")
+    time.sleep(1.0)
+    check("same-digest: restart produced no extra activations",
+          repo_state(REPO_A_URL)["activation_count"] == counts_after_2["repo-a"]
+          and repo_state(REPO_B_URL)["activation_count"] == counts_after_2["repo-b"],
+          f"counts={counts_after_2}")
+
+
+# ---------------------------------------------------------------------------
 # Phase B: code tests
 # ---------------------------------------------------------------------------
 def phase_tests():
@@ -333,6 +472,10 @@ def main() -> int:
         rid, artifact, sha = phase_scenario()
     except Exception as e:  # noqa: BLE001
         check("phase A (disconnect/restart scenario)", False, repr(e))
+    try:
+        phase_same_digest_distinct_ids()
+    except Exception as e:  # noqa: BLE001
+        check("phase A2 (same digest, distinct release ids)", False, repr(e))
     for phase in (phase_tests, phase_build):
         try:
             phase()

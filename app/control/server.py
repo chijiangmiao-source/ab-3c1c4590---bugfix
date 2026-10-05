@@ -48,7 +48,7 @@ def release_view(store: Store, rel: dict, repo_names) -> dict:
     }
 
 
-def build_app(store: Store, repo_names, boot_id: str,
+def build_app(store: Store, machine, repo_names, boot_id: str,
               fault_hooks: bool = False, restart_delay: float = 0.4) -> App:
     app = App("control")
 
@@ -73,8 +73,11 @@ def build_app(store: Store, repo_names, boot_id: str,
         if existing is not None:
             if existing["sha256"] == sha:
                 # Idempotent replay: same identifier + same bytes -> the stored
-                # state is returned and no second activation ever happens.
-                return 200, release_view(store, existing, repo_names)
+                # state is returned and no second activation ever happens. A
+                # local evidence review first reopens any falsely COMPLETED
+                # release so it can reconverge from real repository receipts.
+                machine.review(rid)
+                return 200, release_view(store, store.get_release(rid), repo_names)
             raise ApiError(
                 409,
                 "release_id_in_use",
@@ -87,7 +90,8 @@ def build_app(store: Store, repo_names, boot_id: str,
         except sqlite3.IntegrityError:
             existing = store.get_release(rid)
             if existing and existing["sha256"] == sha:
-                return 200, release_view(store, existing, repo_names)
+                machine.review(rid)
+                return 200, release_view(store, store.get_release(rid), repo_names)
             raise ApiError(409, "release_id_in_use", f"发布标识 {rid} 已被使用")
         log.info("release intent persisted: %s sha256=%s size=%d", rid, sha, len(artifact))
         return 202, release_view(store, store.get_release(rid), repo_names)
@@ -102,6 +106,10 @@ def build_app(store: Store, repo_names, boot_id: str,
         rel = store.get_release(rid)
         if rel is None:
             raise ApiError(404, "not_found", f"发布 {rid} 不存在")
+        # Re-query re-runs the local evidence check: a completed release whose
+        # receipts belong to another release id is reopened and reconverged.
+        machine.review(rid)
+        rel = store.get_release(rid)
         return release_view(store, rel, repo_names)
 
     if fault_hooks:
@@ -133,7 +141,7 @@ class ControlService:
         }
         self.machine = ReleaseMachine(self.store, clients, repo_secrets)
         self.worker = Worker(self.store, self.machine, interval=worker_interval)
-        self.app = build_app(self.store, self.repo_names, self.boot_id,
+        self.app = build_app(self.store, self.machine, self.repo_names, self.boot_id,
                              fault_hooks=fault_hooks)
         self.httpd = make_server(self.app, host, port)
         self._thread = None

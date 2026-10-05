@@ -174,6 +174,131 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(s, 200)
         self.assertEqual(b["state"], "REJECTED")
 
+    def test_same_digest_different_release_ids_get_independent_evidence(self):
+        artifact = b"identical-calibration-bytes"
+        digest = sha(artifact)
+        s, _ = self.post_release("rel-same-1", artifact)
+        self.assertEqual(s, 202)
+        d1 = self.wait_state("rel-same-1", "COMPLETED")
+
+        counts1 = {r: self.repo_state(r)["activation_count"]
+                   for r in (self.c.repo_a, self.c.repo_b)}
+        self.assertEqual(counts1[self.c.repo_a], 1)
+        self.assertEqual(counts1[self.c.repo_b], 1)
+
+        # A fresh release id with byte-identical content must run its OWN
+        # prepare/activate ops at both repos; no receipts may be borrowed.
+        s, _ = self.post_release("rel-same-2", artifact)
+        self.assertEqual(s, 202)
+        d2 = self.wait_state("rel-same-2", "COMPLETED")
+
+        self.assertEqual(d1["sha256"], d2["sha256"])
+        self.assertEqual(d2["current_digest"], digest)
+        for repo_name, repo in (("repo-a", self.c.repo_a), ("repo-b", self.c.repo_b)):
+            for op in ("prepare", "activate"):
+                want_key = op_key("rel-same-2", repo_name, op)
+                got = d2["repos"][repo_name][op]
+                self.assertEqual(got["op_key"], want_key)
+                self.assertEqual(got["digest"], digest)
+                self.assertTrue(got["sig"])
+                # It must differ from the first release's evidence.
+                self.assertNotEqual(got["receipt_id"],
+                                    d1["repos"][repo_name][op]["receipt_id"])
+            # Each repo really processed the second release-derived activate key.
+            key = urllib.parse.quote(
+                op_key("rel-same-2", repo_name, "activate"), safe="")
+            s, b = http_json("GET", f"{repo.url}/v1/ops/{key}", timeout=5)
+            self.assertEqual(s, 200)
+            self.assertEqual(b["receipt"]["receipt_id"],
+                             d2["repos"][repo_name]["activate"]["receipt_id"])
+            # One more activation per repo, pointers still on the same digest.
+            st = self.repo_state(repo)
+            self.assertEqual(st["activation_count"], counts1[repo] + 1)
+            self.assertEqual(st["active_digest"], digest)
+
+        # Replays of either release never trigger further activations.
+        self.post_release("rel-same-1", artifact)
+        self.post_release("rel-same-2", artifact)
+        time.sleep(0.5)
+        self.assertEqual(self.repo_state(self.c.repo_a)["activation_count"], 2)
+        self.assertEqual(self.repo_state(self.c.repo_b)["activation_count"], 2)
+
+    def test_same_digest_second_release_converges_after_control_restart(self):
+        artifact = b"restart-identical-bytes"
+        self.post_release("rel-r-1", artifact)
+        self.wait_state("rel-r-1", "COMPLETED")
+
+        # Submit the second release, then restart the control service before
+        # (or right after) it converges; its own ops must still be processed.
+        s, b = self.post_release("rel-r-2", artifact)
+        self.assertEqual(s, 202)
+        self.c.restart_control()
+        d = self.wait_state("rel-r-2", "COMPLETED")
+        for repo_name in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                self.assertEqual(
+                    d["repos"][repo_name][op]["op_key"],
+                    op_key("rel-r-2", repo_name, op),
+                )
+        # Another restart changes nothing and causes no third activation.
+        self.c.restart_control()
+        time.sleep(0.5)
+        self.assertEqual(self.state_of("rel-r-1")["state"], "COMPLETED")
+        self.assertEqual(self.state_of("rel-r-2")["state"], "COMPLETED")
+        self.assertEqual(self.repo_state(self.c.repo_a)["activation_count"], 2)
+        self.assertEqual(self.repo_state(self.c.repo_b)["activation_count"], 2)
+
+    def test_poisoned_completed_release_is_healed_on_review_and_restart(self):
+        # Simulate the legacy bug: a release recorded as COMPLETED using
+        # receipts whose op_keys derive from a DIFFERENT release id.
+        artifact = b"heal-me-bytes"
+        digest = sha(artifact)
+        self.post_release("rel-legacy-1", artifact)
+        good = self.wait_state("rel-legacy-1", "COMPLETED")
+
+        store = self.c.control.store
+        store.insert_release("rel-legacy-2", digest, artifact, "COMPLETED")
+        for repo_name in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                foreign = good["repos"][repo_name][op]
+                store.put_receipt(
+                    "rel-legacy-2", repo_name, op, foreign["op_key"],
+                    digest, foreign,
+                )
+
+        # Re-querying must expose the lie, reopen the release and let the
+        # worker reconverge using its own release-derived op keys.
+        d = self.wait_state("rel-legacy-2", "COMPLETED")
+        self.assertEqual(d["current_digest"], digest)
+        for repo_name in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                self.assertEqual(
+                    d["repos"][repo_name][op]["op_key"],
+                    op_key("rel-legacy-2", repo_name, op),
+                )
+        self.assertEqual(self.repo_state(self.c.repo_a)["activation_count"], 2)
+        self.assertEqual(self.repo_state(self.c.repo_b)["activation_count"], 2)
+
+        # Poisoned state must also heal after a restart even without a query.
+        store.insert_release("rel-legacy-3", digest, artifact, "COMPLETED")
+        for repo_name in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                foreign = good["repos"][repo_name][op]
+                store.put_receipt(
+                    "rel-legacy-3", repo_name, op, foreign["op_key"],
+                    digest, foreign,
+                )
+        self.c.restart_control()
+        d = self.wait_state("rel-legacy-3", "COMPLETED")
+        for repo_name in ("repo-a", "repo-b"):
+            for op in ("prepare", "activate"):
+                self.assertEqual(
+                    d["repos"][repo_name][op]["op_key"],
+                    op_key("rel-legacy-3", repo_name, op),
+                )
+        self.assertEqual(self.repo_state(self.c.repo_a)["activation_count"], 3)
+        self.assertEqual(self.repo_state(self.c.repo_b)["activation_count"], 3)
+
     def test_restart_converges_from_repo_receipts(self):
         http_json("POST", f"{self.c.repo_b.url}/fault/disconnect-after-activate", {}, timeout=5)
         s, _ = self.post_release("rel-7", b"third")

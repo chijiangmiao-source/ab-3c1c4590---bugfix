@@ -33,14 +33,6 @@ CREATE TABLE IF NOT EXISTS receipts (
   created_at TEXT NOT NULL,
   PRIMARY KEY (release_id, repo, op)
 );
-CREATE TABLE IF NOT EXISTS receipt_cache (
-  repo       TEXT NOT NULL,
-  op         TEXT NOT NULL,
-  digest     TEXT NOT NULL,
-  receipt    TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (repo, op, digest)
-);
 """
 
 
@@ -56,6 +48,9 @@ class Store:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.executescript(SCHEMA)
+            # Removed: receipts are scoped to a release-derived op key and must
+            # never be shared across releases even when digests are identical.
+            self._db.execute("DROP TABLE IF EXISTS receipt_cache")
             self._db.commit()
 
     def close(self) -> None:
@@ -88,13 +83,17 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def pending_release_ids(self, terminal_states) -> list[str]:
-        marks = ",".join("?" for _ in terminal_states)
+    def release_ids_excluding(self, excluded_states) -> list[str]:
+        if not excluded_states:
+            marks = ""
+            params: tuple = ()
+        else:
+            marks = " WHERE state NOT IN (" + ",".join("?" for _ in excluded_states) + ")"
+            params = tuple(excluded_states)
         with self._lock:
             rows = self._db.execute(
-                f"SELECT release_id FROM releases WHERE state NOT IN ({marks})"
-                " ORDER BY created_at",
-                tuple(terminal_states),
+                f"SELECT release_id FROM releases{marks} ORDER BY created_at",
+                params,
             ).fetchall()
         return [r[0] for r in rows]
 
@@ -116,11 +115,6 @@ class Store:
                 " receipt, created_at) VALUES(?,?,?,?,?,?,?)",
                 (release_id, repo, op, op_key, digest, encoded, utcnow()),
             )
-            self._db.execute(
-                "INSERT OR IGNORE INTO receipt_cache(repo, op, digest, receipt, created_at)"
-                " VALUES(?,?,?,?,?)",
-                (repo, op, digest, encoded, utcnow()),
-            )
             self._db.commit()
 
     def get_receipt(self, release_id: str, repo: str, op: str) -> dict | None:
@@ -131,13 +125,14 @@ class Store:
             ).fetchone()
         return json.loads(row[0]) if row else None
 
-    def get_cached_receipt(self, repo: str, op: str, digest: str) -> dict | None:
+    def delete_receipt(self, release_id: str, repo: str, op: str) -> None:
+        """Drop evidence that does not belong to this release's derived op key."""
         with self._lock:
-            row = self._db.execute(
-                "SELECT receipt FROM receipt_cache WHERE repo=? AND op=? AND digest=?",
-                (repo, op, digest),
-            ).fetchone()
-        return json.loads(row[0]) if row else None
+            self._db.execute(
+                "DELETE FROM receipts WHERE release_id=? AND repo=? AND op=?",
+                (release_id, repo, op),
+            )
+            self._db.commit()
 
     def receipts_for(self, release_id: str) -> dict:
         with self._lock:
